@@ -1,0 +1,157 @@
+services:
+  kafka:
+    image: apache/kafka:3.9.0
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_LISTENERS: PLAINTEXT://:9092,CONTROLLER://:9093
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:9092
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    volumes: ['./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro']
+    ports: ['9090:9090']
+  grafana:
+    image: grafana/grafana:11.5.1
+    environment: { GF_SECURITY_ADMIN_PASSWORD: corebank-local-only }
+    volumes:
+      - './infra/grafana/dashboards:/var/lib/grafana/dashboards:ro'
+      - './infra/grafana/provisioning:/etc/grafana/provisioning:ro'
+    ports: ['3008:3000']
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.118.0
+    command: ['--config=/etc/otelcol-contrib/config.yml']
+    volumes: ['./infra/otel/collector-config.yml:/etc/otelcol-contrib/config.yml:ro']
+    ports: ['4318:4318']
+  tempo:
+    image: grafana/tempo:2.7.1
+    command: ['-config.file=/etc/tempo.yml']
+    volumes: ['./infra/tempo/tempo.yml:/etc/tempo.yml:ro']
+    ports: ['3200:3200']
+  identity-db: &database
+    image: postgres:16-alpine
+    environment: { POSTGRES_USER: corebank, POSTGRES_PASSWORD: corebank, POSTGRES_DB: identity }
+  account-db:
+    <<: *database
+    environment: { POSTGRES_USER: corebank, POSTGRES_PASSWORD: corebank, POSTGRES_DB: account }
+  ledger-db:
+    <<: *database
+    environment: { POSTGRES_USER: corebank, POSTGRES_PASSWORD: corebank, POSTGRES_DB: ledger }
+  payment-db:
+    <<: *database
+    environment: { POSTGRES_USER: corebank, POSTGRES_PASSWORD: corebank, POSTGRES_DB: payment }
+  rail-db:
+    <<: *database
+    environment: { POSTGRES_USER: corebank, POSTGRES_PASSWORD: corebank, POSTGRES_DB: rail }
+  reconciliation-db:
+    <<: *database
+    environment:
+      { POSTGRES_USER: corebank, POSTGRES_PASSWORD: corebank, POSTGRES_DB: reconciliation }
+  notification-db:
+    <<: *database
+    environment: { POSTGRES_USER: corebank, POSTGRES_PASSWORD: corebank, POSTGRES_DB: notification }
+  gateway-db:
+    <<: *database
+    environment: { POSTGRES_USER: corebank, POSTGRES_PASSWORD: corebank, POSTGRES_DB: gateway }
+  api-gateway: &service
+    build: .
+    restart: on-failure
+    command: node apps/api-gateway/dist/main.js
+    environment:
+      {
+        PORT: 3000,
+        DATABASE_URL: 'postgres://corebank:corebank@gateway-db:5432/gateway',
+        KAFKA_BROKERS: 'kafka:9092',
+        LEDGER_URL: 'http://ledger-service:3003',
+        IDENTITY_URL: 'http://identity-service:3001',
+        ACCOUNT_URL: 'http://account-service:3002',
+        PAYMENT_URL: 'http://payment-service:3004',
+        RECONCILIATION_URL: 'http://reconciliation-service:3006',
+        JWT_SECRET: '${JWT_SECRET:-development-only-secret-must-be-replaced}',
+        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://otel-collector:4318/v1/traces',
+      }
+    depends_on: [gateway-db, kafka]
+    ports: ['3010:3000']
+  identity-service:
+    <<: *service
+    ports: []
+    command: node apps/identity-service/dist/main.js
+    environment:
+      {
+        PORT: 3001,
+        DATABASE_URL: 'postgres://corebank:corebank@identity-db:5432/identity',
+        KAFKA_BROKERS: 'kafka:9092',
+        JWT_SECRET: '${JWT_SECRET:-development-only-secret-must-be-replaced}',
+      }
+    depends_on: [identity-db, kafka]
+  account-service:
+    <<: *service
+    ports: []
+    command: node apps/account-service/dist/main.js
+    environment:
+      {
+        PORT: 3002,
+        DATABASE_URL: 'postgres://corebank:corebank@account-db:5432/account',
+        KAFKA_BROKERS: 'kafka:9092',
+        JWT_SECRET: '${JWT_SECRET:-development-only-secret-must-be-replaced}',
+      }
+    depends_on: [account-db, kafka]
+  ledger-service:
+    <<: *service
+    ports: []
+    command: node apps/ledger-service/dist/main.js
+    environment:
+      {
+        PORT: 3003,
+        DATABASE_URL: 'postgres://corebank:corebank@ledger-db:5432/ledger',
+        KAFKA_BROKERS: 'kafka:9092',
+      }
+    depends_on: [ledger-db, kafka]
+  payment-service:
+    <<: *service
+    ports: []
+    command: node apps/payment-service/dist/main.js
+    environment:
+      {
+        PORT: 3004,
+        DATABASE_URL: 'postgres://corebank:corebank@payment-db:5432/payment',
+        KAFKA_BROKERS: 'kafka:9092',
+      }
+    depends_on: [payment-db, kafka]
+  rail-simulator:
+    <<: *service
+    ports: []
+    command: node apps/rail-simulator/dist/main.js
+    environment:
+      {
+        PORT: 3005,
+        DATABASE_URL: 'postgres://corebank:corebank@rail-db:5432/rail',
+        KAFKA_BROKERS: 'kafka:9092',
+      }
+    depends_on: [rail-db, kafka]
+  reconciliation-service:
+    <<: *service
+    ports: []
+    command: node apps/reconciliation-service/dist/main.js
+    environment:
+      {
+        PORT: 3006,
+        DATABASE_URL: 'postgres://corebank:corebank@reconciliation-db:5432/reconciliation',
+        KAFKA_BROKERS: 'kafka:9092',
+        OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://otel-collector:4318/v1/traces',
+      }
+    depends_on: [reconciliation-db, kafka]
+  notification-service:
+    <<: *service
+    ports: []
+    command: node apps/notification-service/dist/main.js
+    environment:
+      {
+        PORT: 3007,
+        DATABASE_URL: 'postgres://corebank:corebank@notification-db:5432/notification',
+        KAFKA_BROKERS: 'kafka:9092',
+      }
+    depends_on: [notification-db, kafka]
