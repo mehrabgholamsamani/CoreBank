@@ -142,8 +142,7 @@ libs/
   money/                    Minor-unit money value object
   correlation/              Request and message correlation context
   config/, logging/, errors/, testing/
-docs/                       ADRs, architecture, threat model, testing strategy, runbooks
-infra/                      Prometheus, Grafana and OpenTelemetry/Tempo local configuration
+ infra/                      Prometheus, Grafana and OpenTelemetry/Tempo local configuration
 test/                       Integration scenarios
 ```
 
@@ -213,7 +212,7 @@ The security workflow additionally runs `pnpm audit --audit-level=high`, builds 
 - Correlation IDs are accepted/generated at service boundaries and returned in response headers.
 - Service/database boundaries prevent accidental cross-service financial writes.
 
-See the [threat model](docs/security/threat-model.md), [event catalog](docs/architecture/event-catalog.md), and [failure-mode notes](docs/architecture/failure-modes.md) for the explicit boundaries and assumptions.
+The boundaries and assumptions above are intentionally part of this top-level project record, so the portfolio story remains easy to inspect in one place.
 
 ## Known limitations and what I would do next
 
@@ -228,14 +227,6 @@ CoreBank intentionally stops short of production infrastructure. The goal is to 
 | Basic metrics and local traces                 | Supports correlation and smoke investigation                   | SLOs, retained telemetry, alerting, access controls, cost management               |
 | Opt-in live integration tests                  | Lets the suite run without assuming Docker is present          | Make a container-backed suite mandatory in a dedicated CI job                      |
 | No deployment manifests or load/fault testing  | Explicitly deferred by the project scope                       | Kubernetes/Helm, k6, fault injection, consumer scaling, query tuning               |
-
-## Documentation map
-
-- [Architecture decisions](docs/adr/)
-- [System and container boundaries](docs/architecture/)
-- [Local development and operational runbooks](docs/runbooks/)
-- [Testing strategy](docs/testing/strategy.md)
-- [Security threat model](docs/security/threat-model.md)
 
 ---
 
