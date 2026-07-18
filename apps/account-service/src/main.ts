@@ -25,6 +25,7 @@ import {
   type AccountStatus,
   type AccountStatusChangedV1,
   type MessageEnvelope,
+  ledgerAccountCreatedV1Schema,
 } from '@corebank/event-contracts';
 import * as jwt from 'jsonwebtoken';
 import { randomUUID } from 'node:crypto';
@@ -76,20 +77,37 @@ const ensureWrite = (request: AuthRequest) => {
 };
 const publishOutbox = async () => {
   const rows = await accountDataSource.query(
-    'select id,topic,message from outbox_messages where published_at is null order by created_at limit 50',
+    'select id,topic,message,attempts from outbox_messages where published_at is null order by created_at limit 50',
   );
   if (!rows.length) return;
   const producer = new Kafka({ brokers: config.KAFKA_BROKERS.split(',') }).producer();
   await producer.connect();
   try {
     for (const row of rows) {
-      await producer.send({
-        topic: row.topic,
-        messages: [{ key: row.message.aggregateId, value: JSON.stringify(row.message) }],
-      });
-      await accountDataSource.query('update outbox_messages set published_at=now() where id=$1', [
-        row.id,
-      ]);
+      try {
+        await producer.send({
+          topic: row.topic,
+          messages: [{ key: row.message.aggregateId, value: JSON.stringify(row.message) }],
+        });
+        await accountDataSource.query('update outbox_messages set published_at=now() where id=$1', [
+          row.id,
+        ]);
+      } catch (error) {
+        const attempts = Number(row.attempts) + 1;
+        if (attempts >= 5)
+          await accountDataSource.query(
+            'insert into account_dead_letters(id,message,reason) values($1,$2::jsonb,$3)',
+            [
+              randomUUID(),
+              JSON.stringify(row.message),
+              error instanceof Error ? error.message.slice(0, 500) : 'publish failure',
+            ],
+          );
+        await accountDataSource.query(
+          'update outbox_messages set attempts=$1,published_at=case when $1>=5 then now() else null end where id=$2',
+          [attempts, row.id],
+        );
+      }
     }
   } finally {
     await producer.disconnect();
@@ -150,7 +168,7 @@ class AccountController {
     if (!body.customerId || !body.currency || !['EUR', 'USD', 'SEK'].includes(body.currency))
       throw new HttpException('invalid account request', 400);
     const customer = (
-      await accountDataSource.query('select id from customers where id=$1 and user_id=$2', [
+      await accountDataSource.query('select id,user_id from customers where id=$1 and user_id=$2', [
         body.customerId,
         request.user.sub,
       ])
@@ -169,7 +187,13 @@ class AccountController {
         producer: service,
         occurredAt: metadata.occurredAt,
       },
-      { accountId: id, customerId: body.customerId, currency: body.currency, status: 'ACTIVE' },
+      {
+        accountId: id,
+        customerId: body.customerId,
+        userId: customer?.user_id ?? request.user.sub,
+        currency: body.currency,
+        status: 'ACTIVE',
+      },
     );
     await accountDataSource.transaction(async (manager) => {
       await manager.query(
@@ -251,10 +275,22 @@ class AccountController {
   }
   @Get('accounts') async accounts(@Req() request: AuthRequest) {
     const rows = await accountDataSource.query(
-      'select a.id,a.customer_id as "customerId",a.currency,a.status,a.created_at as "createdAt" from accounts a join customers c on c.id::text=a.customer_id::text where c.user_id::text=$1::text order by a.created_at',
+      'select a.id,a.customer_id as "customerId",a.ledger_account_id as "ledgerAccountId",a.currency,a.status,a.created_at as "createdAt" from accounts a join customers c on c.id::text=a.customer_id::text where c.user_id::text=$1::text order by a.created_at',
       [request.user.sub],
     );
     return rows.map((row: Record<string, unknown>) => ({ ...row, balanceMinor: '0' }));
+  }
+  @Get('accounts/:id/ledger-link') async ledgerLink(@Req() request: AuthRequest) {
+    const id = String(request.params.id);
+    const row = (
+      await accountDataSource.query(
+        'select a.id,a.ledger_account_id as "ledgerAccountId",a.currency,a.status from accounts a join customers c on c.id=a.customer_id where a.id=$1::uuid and ($2=\'ADMIN\' or c.user_id=$3::uuid)',
+        [id, request.user.role, request.user.sub],
+      )
+    )[0];
+    if (!row || !row.ledgerAccountId) throw new HttpException('ledger account not ready', 409);
+    if (row.status !== 'ACTIVE') throw new HttpException('account not active', 409);
+    return row;
   }
   @Get('health') health() {
     return { status: 'ok', service };
@@ -274,6 +310,36 @@ class MetricsController {
     return 'corebank_service_up{service="account-service"} 1\n';
   }
 }
+async function startLedgerAccountConsumer() {
+  const consumer = new Kafka({ brokers: config.KAFKA_BROKERS.split(',') }).consumer({
+    groupId: 'account-service-ledger-links',
+  });
+  await consumer.connect();
+  await consumer.subscribe({ topic: 'ledger.account-created.v1', fromBeginning: false });
+  await consumer.run({
+    eachMessage: async ({ message }) => {
+      if (!message.value) return;
+      const raw = JSON.parse(message.value.toString()) as MessageEnvelope<unknown>;
+      if (
+        raw.messageType !== 'ledger.account-created.v1' ||
+        !ledgerAccountCreatedV1Schema.safeParse(raw.payload).success
+      )
+        return;
+      const payload = raw.payload as { accountId: string; ledgerAccountId: string };
+      await accountDataSource.transaction(async (manager) => {
+        const inserted = await manager.query(
+          'insert into account_inbox_messages(message_id) values($1::uuid) on conflict do nothing returning message_id',
+          [raw.messageId],
+        );
+        if (inserted.length)
+          await manager.query('update accounts set ledger_account_id=$1::uuid where id=$2::uuid', [
+            payload.ledgerAccountId,
+            payload.accountId,
+          ]);
+      });
+    },
+  });
+}
 @Module({ controllers: [AccountController, MetricsController], providers: [JwtGuard] })
 class AppModule {}
 async function bootstrap() {
@@ -286,6 +352,7 @@ async function bootstrap() {
     correlation.run({ correlationId }, next);
   });
   app.enableShutdownHooks();
+  await startLedgerAccountConsumer();
   setInterval(() => void publishOutbox().catch(() => undefined), 1000);
   await app.listen(config.PORT);
   log.info({ port: config.PORT }, 'service started');

@@ -7,7 +7,7 @@
     "lint": "pnpm -r lint",
     "typecheck": "pnpm -r typecheck",
     "test": "pnpm -r test",
-    "test:integration": "node --test test/postgres.integration.test.mjs test/stage2-api.integration.test.mjs test/ledger.integration.test.mjs test/stage5-rail.integration.test.mjs",
+    "test:integration": "node --test test/postgres.integration.test.mjs test/stage2-api.integration.test.mjs test/ledger.integration.test.mjs test/stage5-rail.integration.test.mjs test/stage7-e2e.integration.test.mjs",
     "format:check": "prettier --check .",
     "format": "prettier --write .",
     "prepare": "husky"

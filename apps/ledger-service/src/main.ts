@@ -7,7 +7,9 @@ import {
   Module,
   Param,
   Post,
+  Req,
   ServiceUnavailableException,
+  UseGuards,
 } from '@nestjs/common';
 import { NestFactory } from '@nestjs/core';
 import { validateConfig } from '@corebank/config';
@@ -18,16 +20,26 @@ import { ledgerDataSource } from './data-source';
 import { LedgerService, type Posting } from './ledger.service';
 import { publishLedgerOutbox } from './outbox-publisher';
 import { startLedgerPaymentConsumer } from './payment-messaging';
+import { JwtGuard, requireAdmin, type AuthenticatedRequest } from './auth';
 const service = 'ledger-service';
 const config = validateConfig(process.env);
 const log = logger.child({ service });
 @Controller()
+@UseGuards(JwtGuard)
 class LedgerController {
   constructor(private readonly ledger: LedgerService) {}
-  @Post('ledger/accounts') account(@Body() b: { ownerId?: string; currency?: string }) {
+  @Post('ledger/accounts') account(
+    @Body() b: { ownerId?: string; currency?: string },
+    @Req() request: AuthenticatedRequest,
+  ) {
+    requireAdmin(request);
     return this.ledger.createAccount(b.ownerId ?? '', b.currency ?? '');
   }
-  @Post('ledger/transactions') post(@Body() b: { idempotencyKey?: string; postings?: Posting[] }) {
+  @Post('ledger/transactions') post(
+    @Body() b: { idempotencyKey?: string; postings?: Posting[] },
+    @Req() request: AuthenticatedRequest,
+  ) {
+    requireAdmin(request);
     return this.ledger.post(b.idempotencyKey ?? '', b.postings ?? []);
   }
   @Post('ledger/test-funding') fund(
@@ -39,7 +51,11 @@ class LedgerController {
       currency?: string;
       idempotencyKey?: string;
     },
+    @Req() request: AuthenticatedRequest,
   ) {
+    if (process.env.NODE_ENV === 'production')
+      throw new ServiceUnavailableException('test funding disabled');
+    requireAdmin(request);
     return this.ledger.post(b.idempotencyKey ?? '', [
       {
         accountId: b.fundingAccountId ?? '',
@@ -55,17 +71,43 @@ class LedgerController {
       },
     ]);
   }
+  @Post('ledger/sandbox-funding') sandboxFund(
+    @Body()
+    b: {
+      customerLedgerAccountId?: string;
+      amountMinor?: string;
+      currency?: string;
+      idempotencyKey?: string;
+    },
+    @Req() request: AuthenticatedRequest,
+  ) {
+    requireAdmin(request);
+    return this.ledger.sandboxFund(
+      b.customerLedgerAccountId ?? '',
+      b.amountMinor ?? '',
+      b.currency ?? '',
+      b.idempotencyKey ?? '',
+    );
+  }
   @Post('ledger/transactions/:id/reverse') reverse(
     @Param('id') id: string,
     @Body() b: { idempotencyKey?: string },
+    @Req() request: AuthenticatedRequest,
   ) {
+    requireAdmin(request);
     return this.ledger.reverse(id, b.idempotencyKey ?? '');
   }
-  @Get('ledger/accounts/:id/balance') balance(@Param('id') id: string) {
-    return this.ledger.balance(id);
+  @Get('ledger/accounts/:id/balance') balance(
+    @Param('id') id: string,
+    @Req() request: AuthenticatedRequest,
+  ) {
+    return this.ledger.balance(id, request.user);
   }
-  @Get('ledger/accounts/:id/entries') history(@Param('id') id: string) {
-    return this.ledger.history(id);
+  @Get('ledger/accounts/:id/entries') history(
+    @Param('id') id: string,
+    @Req() request: AuthenticatedRequest,
+  ) {
+    return this.ledger.history(id, request.user);
   }
   @Post('ledger/reservations') reserve(
     @Body()
@@ -76,7 +118,9 @@ class LedgerController {
       idempotencyKey?: string;
       paymentId?: string;
     },
+    @Req() request: AuthenticatedRequest,
   ) {
+    requireAdmin(request);
     return this.ledger.reserve(
       b.accountId ?? '',
       b.amountMinor ?? '',
@@ -88,7 +132,9 @@ class LedgerController {
   @Post('ledger/reservations/:id/release') release(
     @Param('id') id: string,
     @Body() b: { idempotencyKey?: string },
+    @Req() request: AuthenticatedRequest,
   ) {
+    requireAdmin(request);
     return this.ledger.releaseReservation(id, b.idempotencyKey ?? '');
   }
   @Post('ledger/internal-transfers') transfer(
@@ -101,7 +147,9 @@ class LedgerController {
       currency?: string;
       idempotencyKey?: string;
     },
+    @Req() request: AuthenticatedRequest,
   ) {
+    requireAdmin(request);
     return this.ledger.internalTransfer(
       b.reservationId ?? '',
       b.sourceAccountId ?? '',
@@ -126,7 +174,7 @@ class LedgerController {
     }
   }
 }
-@Module({ controllers: [LedgerController], providers: [LedgerService] })
+@Module({ controllers: [LedgerController], providers: [LedgerService, JwtGuard] })
 class AppModule {}
 async function bootstrap() {
   await ledgerDataSource.initialize();

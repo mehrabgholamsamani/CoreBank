@@ -22,6 +22,7 @@ type CreatePayment = {
   kind?: 'INTERNAL_TRANSFER' | 'RAIL_TRANSFER';
   railScenario?: RailScenario;
 };
+type Actor = { sub: string; role: 'CUSTOMER' | 'ADMIN' };
 const allowed: Record<PaymentStatus, PaymentStatus[]> = {
   CREATED: ['VALIDATING', 'CANCELLED', 'FAILED'],
   VALIDATING: ['RESERVING_FUNDS', 'REJECTED', 'FAILED'],
@@ -69,7 +70,12 @@ export class PaymentService {
       [message.messageId, topic, JSON.stringify(message)],
     );
   }
-  async create(body: CreatePayment, audit: Record<string, unknown>) {
+  async create(
+    body: CreatePayment,
+    audit: Record<string, unknown>,
+    links?: { sourceLedgerAccountId: string; destinationLedgerAccountId: string },
+  ) {
+    body = { ...body, ...links };
     if (!valid(body)) throw new HttpException('invalid payment request', 400);
     const hash = createHash('sha256')
       .update(JSON.stringify({ ...body, idempotencyKey: undefined }))
@@ -90,7 +96,7 @@ export class PaymentService {
       const id = randomUUID();
       const kind = body.kind ?? 'INTERNAL_TRANSFER';
       await client.query(
-        "insert into payments(id,idempotency_key,request_hash,source_ledger_account_id,destination_ledger_account_id,amount_minor,currency,kind,status,audit,rail_scenario) values($1,$2,$3,$4::uuid,$5::uuid,$6::bigint,$7,$8,'RESERVING_FUNDS',$9::jsonb,$10)",
+        "insert into payments(id,idempotency_key,request_hash,source_ledger_account_id,destination_ledger_account_id,amount_minor,currency,kind,status,audit,rail_scenario,actor_id) values($1,$2,$3,$4::uuid,$5::uuid,$6::bigint,$7,$8,'RESERVING_FUNDS',$9::jsonb,$10,$11::uuid)",
         [
           id,
           body.idempotencyKey,
@@ -102,6 +108,7 @@ export class PaymentService {
           kind,
           JSON.stringify(audit),
           body.railScenario ?? 'SUCCESS',
+          String(audit.actorId),
         ],
       );
       const created: PaymentCreatedV1 = {
@@ -126,6 +133,7 @@ export class PaymentService {
           amountMinor: body.amountMinor,
           currency: body.currency,
           idempotencyKey: `payment:${id}:reserve`,
+          requesterId: String(audit.actorId),
         }),
       );
       await client.query('commit');
@@ -150,9 +158,14 @@ export class PaymentService {
       failureReason: row.failure_reason,
     };
   }
-  async get(id: string) {
+  private ensureOwner(row: Record<string, unknown>, actor: Actor) {
+    if (actor.role !== 'ADMIN' && row.actor_id !== actor.sub)
+      throw new HttpException('payment not found', 404);
+  }
+  async get(id: string, actor?: Actor) {
     const row = (await this.pool.query('select * from payments where id=$1::uuid', [id])).rows[0];
     if (!row) throw new HttpException('payment not found', 404);
+    if (actor) this.ensureOwner(row, actor);
     return this.view(row);
   }
   async fundsReserved(event: MessageEnvelope<LedgerFundsReservedV1>) {
@@ -162,7 +175,24 @@ export class PaymentService {
           event.payload.paymentId,
         ])
       ).rows[0];
-      if (!p || p.status !== 'RESERVING_FUNDS') return;
+      if (!p) return;
+      if (p.status === 'CANCELLED') {
+        await c.query(
+          'update payments set reservation_id=$1::uuid,updated_at=now() where id=$2::uuid',
+          [event.payload.reservationId, p.id],
+        );
+        await this.outbox(
+          c,
+          'ledger.release-funds.v1',
+          this.envelope('ledger.release-funds.v1', p.id, {
+            paymentId: p.id,
+            reservationId: event.payload.reservationId,
+            idempotencyKey: `payment:${p.id}:cancel`,
+          }),
+        );
+        return;
+      }
+      if (p.status !== 'RESERVING_FUNDS') return;
       if (p.kind === 'RAIL_TRANSFER') {
         await c.query(
           "update payments set status='SUBMITTED',reservation_id=$1::uuid,updated_at=now() where id=$2::uuid",
@@ -206,7 +236,37 @@ export class PaymentService {
           event.payload.paymentId,
         ])
       ).rows[0];
-      if (!p || !allowed[p.status as PaymentStatus].includes('SETTLED')) return;
+      if (!p) return;
+      if (p.status === 'CANCELLED') {
+        const adjustmentId = randomUUID();
+        await c.query(
+          "insert into payment_adjustments(id,payment_id,idempotency_key,request_hash,amount_minor,action,status) values($1,$2::uuid,$3,$4,$5::bigint,'REVERSAL','PENDING') on conflict(idempotency_key) do nothing",
+          [
+            adjustmentId,
+            p.id,
+            `payment:${p.id}:cancel-reversal`,
+            createHash('sha256').update(`${p.id}:cancel-reversal`).digest('hex'),
+            String(p.amount_minor),
+          ],
+        );
+        await this.outbox(
+          c,
+          'ledger.post-adjustment.v1',
+          this.envelope('ledger.post-adjustment.v1', p.id, {
+            adjustmentId,
+            paymentId: p.id,
+            originalTransactionId: event.payload.transactionId,
+            sourceLedgerAccountId: p.source_ledger_account_id,
+            destinationLedgerAccountId: p.destination_ledger_account_id,
+            amountMinor: String(p.amount_minor),
+            currency: p.currency,
+            action: 'REVERSAL',
+            idempotencyKey: `payment:${p.id}:cancel-reversal`,
+          }),
+        );
+        return;
+      }
+      if (!allowed[p.status as PaymentStatus].includes('SETTLED')) return;
       await c.query(
         "update payments set status='SETTLED',ledger_transaction_id=$1::uuid,updated_at=now() where id=$2::uuid",
         [event.payload.transactionId, p.id],
@@ -282,16 +342,24 @@ export class PaymentService {
         );
     });
   }
-  async railTemporarilyFailed(event: MessageEnvelope<{ paymentId: string }>) {
-    await this.consume(event, async () => undefined);
+  async railTemporarilyFailed(
+    event: MessageEnvelope<{ paymentId: string; retryAfterMs?: number }>,
+  ) {
+    await this.consume(event, async (c) => {
+      await c.query(
+        "update payments set retry_attempts=retry_attempts+1,next_retry_at=now() + ($1::text || ' milliseconds')::interval,updated_at=now() where id=$2::uuid and status='SUBMITTED'",
+        [String(event.payload.retryAfterMs ?? 1000), event.payload.paymentId],
+      );
+    });
   }
-  async cancel(id: string) {
+  async cancel(id: string, actor: Actor) {
     const c = await this.pool.connect();
     await c.query('begin');
     try {
       const p = (await c.query('select * from payments where id=$1::uuid for update', [id]))
         .rows[0];
       if (!p) throw new HttpException('payment not found', 404);
+      this.ensureOwner(p, actor);
       if (!['RESERVING_FUNDS', 'AUTHORIZED', 'SUBMITTED'].includes(p.status))
         throw new HttpException('payment cannot be cancelled', 409);
       await c.query("update payments set status='CANCELLED',updated_at=now() where id=$1::uuid", [
@@ -316,27 +384,29 @@ export class PaymentService {
       c.release();
     }
   }
-  async refund(id: string, amountMinor: string, idempotencyKey: string) {
+  async refund(id: string, amountMinor: string, idempotencyKey: string, actor: Actor) {
     if (!/^[1-9]\d*$/.test(amountMinor) || !idempotencyKey)
       throw new HttpException('valid amount and idempotency key required', 400);
-    return this.adjust(id, amountMinor, idempotencyKey, 'REFUND');
+    return this.adjust(id, amountMinor, idempotencyKey, 'REFUND', actor);
   }
-  async reverse(id: string, idempotencyKey: string) {
+  async reverse(id: string, idempotencyKey: string, actor: Actor) {
     if (!idempotencyKey) throw new HttpException('idempotency key required', 400);
-    const p = (await this.get(id)) as { amountMinor: string };
-    return this.adjust(id, p.amountMinor, idempotencyKey, 'REVERSAL');
+    const p = (await this.get(id, actor)) as { amountMinor: string };
+    return this.adjust(id, p.amountMinor, idempotencyKey, 'REVERSAL', actor);
   }
   private async adjust(
     id: string,
     amountMinor: string,
     idempotencyKey: string,
     action: 'REFUND' | 'REVERSAL',
+    actor: Actor,
   ) {
     const c = await this.pool.connect();
     await c.query('begin');
     try {
       const p = (await c.query('select * from payments where id=$1::uuid for update', [id]))
         .rows[0];
+      if (p) this.ensureOwner(p, actor);
       if (
         !p ||
         (action === 'REFUND'
@@ -408,7 +478,7 @@ export class PaymentService {
           event.payload.paymentId,
         ])
       ).rows[0];
-      if (!p || !['SETTLED', 'PARTIALLY_REFUNDED'].includes(p.status)) return;
+      if (!p || !['SETTLED', 'PARTIALLY_REFUNDED', 'CANCELLED'].includes(p.status)) return;
       const adjustment = (
         await c.query(
           "update payment_adjustments set status='POSTED' where id=$1::uuid and status='PENDING' returning id",
@@ -423,11 +493,13 @@ export class PaymentService {
         )
       ).rows[0].amount;
       const status =
-        event.payload.action === 'REVERSAL'
-          ? 'REVERSED'
-          : BigInt(refunded) === BigInt(p.amount_minor)
-            ? 'REFUNDED'
-            : 'PARTIALLY_REFUNDED';
+        p.status === 'CANCELLED'
+          ? 'CANCELLED'
+          : event.payload.action === 'REVERSAL'
+            ? 'REVERSED'
+            : BigInt(refunded) === BigInt(p.amount_minor)
+              ? 'REFUNDED'
+              : 'PARTIALLY_REFUNDED';
       await c.query(
         'update payments set status=$1,refunded_minor=$2::bigint,updated_at=now() where id=$3::uuid',
         [status, refunded, p.id],

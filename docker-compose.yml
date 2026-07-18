@@ -85,6 +85,9 @@ services:
         DATABASE_URL: 'postgres://corebank:corebank@identity-db:5432/identity',
         KAFKA_BROKERS: 'kafka:9092',
         JWT_SECRET: '${JWT_SECRET:-development-only-secret-must-be-replaced}',
+        SANDBOX_ALLOW_BOOTSTRAP_ADMIN: 'true',
+        SANDBOX_ADMIN_EMAIL: '${SANDBOX_ADMIN_EMAIL:-admin@corebank.local}',
+        SANDBOX_ADMIN_PASSWORD: '${SANDBOX_ADMIN_PASSWORD:-corebank-local-admin-password}',
       }
     depends_on: [identity-db, kafka]
   account-service:
@@ -108,6 +111,8 @@ services:
         PORT: 3003,
         DATABASE_URL: 'postgres://corebank:corebank@ledger-db:5432/ledger',
         KAFKA_BROKERS: 'kafka:9092',
+        JWT_SECRET: '${JWT_SECRET:-development-only-secret-must-be-replaced}',
+        SANDBOX_MODE: 'true',
       }
     depends_on: [ledger-db, kafka]
   payment-service:
@@ -119,6 +124,8 @@ services:
         PORT: 3004,
         DATABASE_URL: 'postgres://corebank:corebank@payment-db:5432/payment',
         KAFKA_BROKERS: 'kafka:9092',
+        JWT_SECRET: '${JWT_SECRET:-development-only-secret-must-be-replaced}',
+        ACCOUNT_URL: 'http://account-service:3002',
       }
     depends_on: [payment-db, kafka]
   rail-simulator:
@@ -141,6 +148,7 @@ services:
         PORT: 3006,
         DATABASE_URL: 'postgres://corebank:corebank@reconciliation-db:5432/reconciliation',
         KAFKA_BROKERS: 'kafka:9092',
+        JWT_SECRET: '${JWT_SECRET:-development-only-secret-must-be-replaced}',
         OTEL_EXPORTER_OTLP_TRACES_ENDPOINT: 'http://otel-collector:4318/v1/traces',
       }
     depends_on: [reconciliation-db, kafka]

@@ -47,22 +47,56 @@ const audit = (request: Request, actorId?: string): Audit => ({
   occurredAt: new Date().toISOString(),
 });
 const tokenHash = (token: string) => createHash('sha256').update(token).digest('hex');
+const bootstrapSandboxAdmin = async () => {
+  if (process.env.SANDBOX_ALLOW_BOOTSTRAP_ADMIN !== 'true') return;
+  const email = process.env.SANDBOX_ADMIN_EMAIL?.toLowerCase();
+  const password = process.env.SANDBOX_ADMIN_PASSWORD;
+  if (!email || !/^\S+@\S+\.\S+$/.test(email) || !password || password.length < 12)
+    throw new Error('sandbox admin email and a 12-character password are required');
+  await identityDataSource.query(
+    "insert into users(id,email,password_hash,role,audit) values($1,$2,$3,'ADMIN',$4::jsonb) on conflict(email) do nothing",
+    [
+      randomUUID(),
+      email,
+      await bcrypt.hash(password, 12),
+      JSON.stringify({ actorId: 'sandbox-bootstrap', occurredAt: new Date().toISOString() }),
+    ],
+  );
+};
 const publishOutbox = async () => {
   const rows = await identityDataSource.query(
-    'select id, topic, message from outbox_messages where published_at is null order by created_at limit 50',
+    'select id, topic, message, attempts from outbox_messages where published_at is null order by created_at limit 50',
   );
   if (!rows.length) return;
   const producer = new Kafka({ brokers: config.KAFKA_BROKERS.split(',') }).producer();
   await producer.connect();
   try {
     for (const row of rows) {
-      await producer.send({
-        topic: row.topic,
-        messages: [{ key: row.message.aggregateId, value: JSON.stringify(row.message) }],
-      });
-      await identityDataSource.query('update outbox_messages set published_at=now() where id=$1', [
-        row.id,
-      ]);
+      try {
+        await producer.send({
+          topic: row.topic,
+          messages: [{ key: row.message.aggregateId, value: JSON.stringify(row.message) }],
+        });
+        await identityDataSource.query(
+          'update outbox_messages set published_at=now() where id=$1',
+          [row.id],
+        );
+      } catch (error) {
+        const attempts = Number(row.attempts) + 1;
+        if (attempts >= 5)
+          await identityDataSource.query(
+            'insert into identity_dead_letters(id,message,reason) values($1,$2::jsonb,$3)',
+            [
+              randomUUID(),
+              JSON.stringify(row.message),
+              error instanceof Error ? error.message.slice(0, 500) : 'publish failure',
+            ],
+          );
+        await identityDataSource.query(
+          'update outbox_messages set attempts=$1,published_at=case when $1>=5 then now() else null end where id=$2',
+          [attempts, row.id],
+        );
+      }
     }
   } finally {
     await producer.disconnect();
@@ -158,8 +192,8 @@ class IdentityController {
   ) {
     const refreshToken = randomUUID();
     await manager.query(
-      "insert into refresh_tokens(id,token,token_hash,user_id,expires_at,audit) values($1,$2,$3,$4,now() + interval '30 days',$5::jsonb)",
-      [randomUUID(), refreshToken, tokenHash(refreshToken), user.id, JSON.stringify(metadata)],
+      "insert into refresh_tokens(id,token_hash,user_id,expires_at,audit) values($1,$2,$3,now() + interval '30 days',$4::jsonb)",
+      [randomUUID(), tokenHash(refreshToken), user.id, JSON.stringify(metadata)],
     );
     return {
       accessToken: jwt.sign(
@@ -196,6 +230,7 @@ class AppModule {}
 async function bootstrap() {
   await identityDataSource.initialize();
   await identityDataSource.runMigrations();
+  await bootstrapSandboxAdmin();
   const app = await NestFactory.create(AppModule);
   app.use((request: Request, response: Response, next: NextFunction) => {
     const correlationId = correlationIdFrom(request.headers['x-correlation-id']);
