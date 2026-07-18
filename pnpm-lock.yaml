@@ -265,6 +265,9 @@ importers:
       '@opentelemetry/sdk-node':
         specifier: ^0.57.2
         version: 0.57.2(@opentelemetry/api@1.9.1)
+      jsonwebtoken:
+        specifier: ^9.0.3
+        version: 9.0.3
       kafkajs:
         specifier: ^2.2.4
         version: 2.2.4
@@ -284,6 +287,9 @@ importers:
       '@nestjs/cli':
         specifier: ^10.4.9
         version: 10.4.9
+      '@types/jsonwebtoken':
+        specifier: ^9.0.10
+        version: 9.0.10
       '@types/pg':
         specifier: ^8.20.0
         version: 8.20.0
@@ -363,6 +369,9 @@ importers:
       '@opentelemetry/sdk-node':
         specifier: ^0.57.2
         version: 0.57.2(@opentelemetry/api@1.9.1)
+      jsonwebtoken:
+        specifier: ^9.0.3
+        version: 9.0.3
       kafkajs:
         specifier: ^2.2.4
         version: 2.2.4
@@ -379,6 +388,9 @@ importers:
       '@nestjs/cli':
         specifier: ^10.4.9
         version: 10.4.9
+      '@types/jsonwebtoken':
+        specifier: ^9.0.10
+        version: 9.0.10
       '@types/pg':
         specifier: ^8.20.0
         version: 8.20.0
@@ -464,6 +476,9 @@ importers:
       '@opentelemetry/sdk-node':
         specifier: ^0.57.2
         version: 0.57.2(@opentelemetry/api@1.9.1)
+      jsonwebtoken:
+        specifier: ^9.0.3
+        version: 9.0.3
       kafkajs:
         specifier: ^2.2.4
         version: 2.2.4
@@ -480,6 +495,9 @@ importers:
       '@nestjs/cli':
         specifier: ^10.4.9
         version: 10.4.9
+      '@types/jsonwebtoken':
+        specifier: ^9.0.10
+        version: 9.0.10
       '@types/pg':
         specifier: ^8.20.0
         version: 8.20.0
@@ -494,7 +512,11 @@ importers:
 
   libs/errors: {}
 
-  libs/event-contracts: {}
+  libs/event-contracts:
+    dependencies:
+      zod:
+        specifier: ^3.24.2
+        version: 3.25.76
 
   libs/logging:
     dependencies:
