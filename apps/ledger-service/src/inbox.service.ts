@@ -1,10 +1,11 @@
+import type { QueryRunner } from 'typeorm';
 import { ledgerDataSource } from './data-source';
 
-/** Runs a consumer operation once per message ID in the same local transaction. */
-export const processLedgerInbox = async (
+/** Applies an inbound message and all resulting effects in one local transaction. */
+export const processLedgerInbox = async <T>(
   messageId: string,
-  operation: () => Promise<void>,
-): Promise<boolean> => {
+  operation: (runner: QueryRunner) => Promise<T>,
+): Promise<{ processed: boolean; value?: T }> => {
   const runner = ledgerDataSource.createQueryRunner();
   await runner.connect();
   await runner.startTransaction();
@@ -15,11 +16,11 @@ export const processLedgerInbox = async (
     );
     if (!inserted.length) {
       await runner.commitTransaction();
-      return false;
+      return { processed: false };
     }
-    await operation();
+    const value = await operation(runner);
     await runner.commitTransaction();
-    return true;
+    return { processed: true, value };
   } catch (error) {
     await runner.rollbackTransaction();
     throw error;

@@ -4,6 +4,16 @@ import type {
   LedgerInternalTransferPostedV1,
   MessageEnvelope,
 } from '@corebank/event-contracts';
+import {
+  ledgerAdjustmentPostedV1Schema,
+  ledgerFundsReservedV1Schema,
+  ledgerInternalTransferPostedV1Schema,
+  parseMessageEnvelope,
+  paymentFailureSchema,
+  paymentIdSchema,
+  railPaymentAcceptedV1Schema,
+  railTemporaryFailureSchema,
+} from '@corebank/event-contracts';
 import { randomUUID } from 'node:crypto';
 import { paymentPool } from './data-source';
 import { PaymentService } from './payment.service';
@@ -76,7 +86,39 @@ export const startPaymentConsumer = async (payments: PaymentService): Promise<vo
   await consumer.run({
     eachMessage: async ({ message, topic }) => {
       if (!message.value) return;
-      const event = JSON.parse(message.value.toString()) as MessageEnvelope<unknown>;
+      let raw: unknown;
+      try {
+        raw = JSON.parse(message.value.toString());
+      } catch {
+        await paymentPool.query(
+          'insert into payment_dead_letters(id,message,reason) values($1,$2::jsonb,$3)',
+          [randomUUID(), JSON.stringify({ value: message.value.toString() }), 'invalid JSON'],
+        );
+        return;
+      }
+      const schema =
+        topic === 'ledger.funds-reserved.v1'
+          ? ledgerFundsReservedV1Schema
+          : topic === 'ledger.internal-transfer-posted.v1'
+            ? ledgerInternalTransferPostedV1Schema
+            : topic === 'ledger.funds-reservation-rejected.v1' ||
+                topic === 'rail.payment-rejected.v1'
+              ? paymentFailureSchema
+              : topic === 'rail.payment-accepted.v1'
+                ? railPaymentAcceptedV1Schema
+                : topic === 'rail.payment-temporarily-failed.v1'
+                  ? railTemporaryFailureSchema
+                  : topic === 'ledger.adjustment-posted.v1'
+                    ? ledgerAdjustmentPostedV1Schema
+                    : paymentIdSchema;
+      const event = parseMessageEnvelope(raw, topic, schema as never);
+      if (!event) {
+        await paymentPool.query(
+          'insert into payment_dead_letters(id,message,reason) values($1,$2::jsonb,$3)',
+          [randomUUID(), JSON.stringify(raw), `invalid ${topic} envelope`],
+        );
+        return;
+      }
       if (topic === 'ledger.funds-reserved.v1')
         await payments.fundsReserved(event as MessageEnvelope<LedgerFundsReservedV1>);
       if (topic === 'ledger.internal-transfer-posted.v1')

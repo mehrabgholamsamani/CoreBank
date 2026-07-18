@@ -6,5 +6,7 @@ export const migrateReconciliation = async (pool: Pool): Promise<void> => {
     create table if not exists discrepancies (id uuid primary key, run_id uuid not null references reconciliation_runs(id), external_reference varchar not null, expected_minor bigint, actual_minor bigint, currency varchar(3), kind varchar not null, status varchar not null default 'OPEN', resolution jsonb, created_at timestamptz not null default now(), resolved_at timestamptz);
     create table if not exists reconciliation_audit (id uuid primary key, discrepancy_id uuid not null references discrepancies(id), action varchar not null, actor_id varchar not null, correlation_id varchar not null, details jsonb not null, occurred_at timestamptz not null default now());
     create table if not exists reconciliation_inbox (message_id uuid primary key, processed_at timestamptz not null default now());
+    create table if not exists expected_settlements (payment_id uuid primary key, external_reference varchar unique, amount_minor bigint not null, currency varchar(3) not null, updated_at timestamptz not null default now());
+    create table if not exists reconciliation_dead_letters (id uuid primary key, message jsonb not null, reason varchar not null, created_at timestamptz not null default now());
   `);
 };
